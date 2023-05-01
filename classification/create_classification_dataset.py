@@ -62,7 +62,7 @@ Example usage:
 """
 from __future__ import annotations
 
-import argparse
+import argparse, path
 from collections.abc import Container, MutableMapping
 import json
 import os
@@ -77,7 +77,8 @@ from classification import detect_and_crop
 
 DATASET_FILENAME = 'classification_ds.csv'
 LABEL_INDEX_FILENAME = 'label_index.json'
-SPLITS_FILENAME = 'splits.json'
+SPLITS_BY_LOCATION_FILENAME = 'splits_by_loc.json'
+SPLITS_BY_SEQUENCE_FILENAME = 'splits_by_seq.json'
 
 
 def main(output_dir: str,
@@ -92,6 +93,7 @@ def main(output_dir: str,
          val_frac: Optional[float],
          test_frac: Optional[float],
          splits_method: Optional[str],
+         avoid_overlap: Optional[str],
          label_spec_json_path: Optional[str]) -> None:
     """Main function."""
     # input validation
@@ -151,23 +153,29 @@ def main(output_dir: str,
 
     if 'splits' in mode:
         assert splits_method is not None
+        assert avoid_overlap is not None
         assert val_frac is not None
         assert (match_test is None) != (test_frac is None)
         if test_frac is None:
             test_frac = 0
 
-        print(f'Creating splits using "{splits_method}" method...')
+        print(f'Creating splits using "{splits_method}" method avoiding "{avoid_overlap}" overlap...')
         df = pd.read_csv(dataset_path, index_col=False, float_precision='high')
 
         if splits_method == 'random':
-            split_to_locs = create_splits_random(
-                df, val_frac, test_frac, test_split=test_set_locs)
+            split_to_locs, split_to_seq = create_splits_random(
+                df, val_frac, test_frac, test_split=test_set_locs, avoid_overlap=avoid_overlap)
         else:
             split_to_locs = create_splits_smallest_label_first(
                 df, val_frac, test_frac, test_split=test_set_locs,
                 label_spec_json_path=label_spec_json_path)
-        with open(os.path.join(output_dir, SPLITS_FILENAME), 'w') as f:
-            json.dump(split_to_locs, f, indent=1)
+        if split_to_locs is not None:
+            with open(os.path.join(output_dir, '{}_{}'.format(avoid_overlap, SPLITS_BY_LOCATION_FILENAME)), 'w') as f:
+                json.dump(split_to_locs, f, indent=1)
+        if split_to_seq is not None:
+            with open(os.path.join(output_dir, '{}_{}'.format(avoid_overlap, SPLITS_BY_SEQUENCE_FILENAME)), 'w') as f:
+                json.dump(split_to_seq, f, indent=1)
+        
 
 
 def create_classification_csv(
@@ -220,8 +228,10 @@ def create_classification_csv(
     """
     assert 0 <= confidence_threshold <= 1
 
+    # columns = [
+    #     'path', 'dataset', 'location', 'dataset_class', 'confidence', 'label']
     columns = [
-        'path', 'dataset', 'location', 'dataset_class', 'confidence', 'label']
+        'path', 'dataset', 'location', 'seq_id', 'dataset_class', 'confidence', 'label']
     if append_df is not None:
         assert (append_df.columns == columns).all()
 
@@ -245,26 +255,47 @@ def create_classification_csv(
     # always save as .jpg for consistency
     crop_path_template = {
         True: '{img_path}___crop{n:>02d}.jpg',
-        False: '{img_path}___crop{n:>02d}_' + f'mdv{detector_version}.jpg'
+        # False: '{img_path}___crop{n:>02d}_' + f'md_v{detector_version}.0.pt.jpg'
+        False: '{img_path}___crop{n:>02d}_' + f'megadetector_v{detector_version}.jpg'
+
     }
 
     for img_path, img_info in tqdm(js.items()):
         ds, img_file = img_path.split('/', maxsplit=1)
-
+        
+        # edited by Nasir
+        use_GT = False
         # get bounding boxes
-        if 'bbox' in img_info:  # ground-truth bounding boxes
+        if 'bbox' in img_info and use_GT:  # ground-truth bounding boxes
             bbox_dicts = img_info['bbox']
             is_ground_truth = True
         else:  # get bounding boxes from detector cache
             if img_file in detection_cache[ds]:
-                bbox_dicts = detection_cache[ds][img_file]['detections']
+                bbox_dicts = detection_cache[ds][img_file.replace(ds,'')]['detections']
                 # convert from category ID to category name
                 for d in bbox_dicts:
                     d['category'] = cat_id_to_name[d['category']]
             else:
                 missing_detections.append(img_path)
                 continue
-            is_ground_truth = False
+            is_ground_truth = False        
+        
+        
+         
+        # # get bounding boxes
+        # if 'bbox' in img_info:  # ground-truth bounding boxes
+        #     bbox_dicts = img_info['bbox']
+        #     is_ground_truth = True
+        # else:  # get bounding boxes from detector cache
+        #     if img_file in detection_cache[ds]:
+        #         bbox_dicts = detection_cache[ds][img_file]['detections']
+        #         # convert from category ID to category name
+        #         for d in bbox_dicts:
+        #             d['category'] = cat_id_to_name[d['category']]
+        #     else:
+        #         missing_detections.append(img_path)
+        #         continue
+        #     is_ground_truth = False
 
         # check if crops are already downloaded, and ignore bboxes below the
         # confidence threshold
@@ -279,12 +310,18 @@ def create_classification_csv(
             crop_path = crop_path_template[is_ground_truth].format(
                 img_path=img_path, n=i)
             full_crop_path = os.path.join(cropped_images_dir, crop_path)
+            
+            
+            # if 'S1/B05/B05_R1/S1_B05_R1_PICT0012.JPG' in full_crop_path:
+            #     print(full_crop_path)
             if not os.path.exists(full_crop_path):
                 images_missing_crop.append((img_path, i))
             else:
                 # assign all images without location info to 'unknown_location'
+                # print(full_crop_path)
                 img_loc = img_info.get('location', 'unknown_location')
-                row = [crop_path, ds, img_loc, img_info['class'],
+                img_seq = img_info.get('seq_id', 'unknown_location')
+                row = [crop_path, ds, img_loc, img_seq, img_info['class'],
                        conf, ','.join(img_info['label'])]
                 rows.append(row)
         if len(rows) == 0:
@@ -293,7 +330,7 @@ def create_classification_csv(
         all_rows += rows
 
     df = pd.DataFrame(data=all_rows, columns=columns)
-
+    print(df)
     # remove images from labels that have fewer than min_locs locations
     if min_locs is not None:
         nlocs_per_label = df.groupby('label').apply(
@@ -303,8 +340,9 @@ def create_classification_csv(
         invalid_labels = nlocs_per_label.index[~valid_labels_mask]
         orig = len(df)
         df = df[df['label'].isin(valid_labels)]
-        print(f'Excluding {orig - len(df)} crops from {len(invalid_labels)} '
+        print(f'Not enough samples/loc, Excluding {orig - len(df)} crops from {len(invalid_labels)} '
               'labels:', invalid_labels.tolist())
+
 
     if exclude_locs is not None:
         mask = ~pd.Series(zip(df['dataset'], df['location'])).isin(exclude_locs)
@@ -325,6 +363,7 @@ def create_classification_csv(
 def create_splits_random(df: pd.DataFrame, val_frac: float,
                          test_frac: float = 0.,
                          test_split: Optional[set[tuple[str, str]]] = None,
+                         avoid_overlap: Optional[str] = None,
                          ) -> dict[str, list[tuple[str, str]]]:
     """
     Args:
@@ -343,65 +382,228 @@ def create_splits_random(df: pd.DataFrame, val_frac: float,
     if test_split is not None:
         assert test_frac == 0
     train_frac = 1. - val_frac - test_frac
-    targets = {'train': train_frac, 'val': val_frac, 'test': test_frac}
+    targets = {'train': train_frac, 'val': val_frac, 'test': test_frac, 'train_val': train_frac + val_frac}
 
     # merge dataset and location into a single string '<dataset>/<location>'
-    df['dataset_location'] = df['dataset'] + '/' + df['location']
+    df['dataset_location'] = df['dataset'] + '/' + df['location'].astype(str)  #new fix
 
-    # create DataFrame of counts. rows = locations, columns = labels
-    loc_label_counts = (df.groupby(['label', 'dataset_location']).size()
-                        .unstack('label', fill_value=0))
-    num_locs = len(loc_label_counts)
+    # merge dataset and sequence id into a single string '<dataset>/<seq_id>'
+    df['dataset_seq'] = df['dataset'] +  '/' + df['seq_id'].astype(str)   #new fix
 
-    # label_count: label => number of examples
-    # loc_count: label => number of locs containing that label
-    label_count = loc_label_counts.sum()
-    loc_count = (loc_label_counts > 0).sum()
 
-    best_score = np.inf  # lower is better
-    best_splits = None
-    for _ in tqdm(range(10_000)):
+    if avoid_overlap=='location':
+        # create DataFrame of counts. rows = locations, columns = labels
+        loc_label_counts = (df.groupby(['label', 'dataset_location']).size()
+                            .unstack('label', fill_value=0))
+        num_locs = len(loc_label_counts)
+        # label_count: label => number of examples
+        # loc_count: label => number of locs containing that label
+        label_count = loc_label_counts.sum()
+        loc_count = (loc_label_counts > 0).sum()
 
-        # generate a new split
-        num_train = int(num_locs * (train_frac + np.random.uniform(-.03, .03)))
-        if test_frac > 0:
-            num_val = int(num_locs * (val_frac + np.random.uniform(-.03, .03)))
-        else:
-            num_val = num_locs - num_train
-        permuted_locs = loc_label_counts.index[np.random.permutation(num_locs)]
-        split_to_locs = {'train': permuted_locs[:num_train],
-                         'val': permuted_locs[num_train:num_train + num_val]}
-        if test_frac > 0:
-            split_to_locs['test'] = permuted_locs[num_train + num_val:]
+        best_score = np.inf  # lower is better
+        best_splits = None
+        for _ in tqdm(range(10_000)):
 
-        # score the split
-        score = 0.
-        for split, locs in split_to_locs.items():
-            split_df = loc_label_counts.loc[locs]
-            target = targets[split]
+            # generate a new split
+            num_train = int(num_locs * (train_frac + np.random.uniform(-.03, .03)))
+            if test_frac > 0:
+                num_val = int(num_locs * (val_frac + np.random.uniform(-.03, .03)))
+            else:
+                num_val = num_locs - num_train
+            permuted_locs = loc_label_counts.index[np.random.permutation(num_locs)]
+            split_to_locs = {'train': permuted_locs[:num_train],
+                            'val': permuted_locs[num_train:num_train + num_val]}
+            if test_frac > 0:
+                split_to_locs['test'] = permuted_locs[num_train + num_val:]
 
-            # SSE for # of images per label (with 2x weight)
-            crop_frac = split_df.sum() / label_count
-            score += 2 * ((crop_frac - target) ** 2).sum()
+            # score the split
+            score = 0.
+            for split, locs in split_to_locs.items():
+                split_df = loc_label_counts.loc[locs]
+                target = targets[split]
 
-            # SSE for # of locs per label
-            loc_frac = (split_df > 0).sum() / loc_count
-            score += ((loc_frac - target) ** 2).sum()
+                # SSE for # of images per label (with 2x weight)
+                crop_frac = split_df.sum() / label_count
+                score += 2 * ((crop_frac - target) ** 2).sum()
 
-        if score < best_score:
-            tqdm.write(f'New lowest score: {score}')
-            best_score = score
-            best_splits = split_to_locs
+                # SSE for # of locs per label
+                loc_frac = (split_df > 0).sum() / loc_count
+                score += ((loc_frac - target) ** 2).sum()
 
-    assert best_splits is not None
-    split_to_locs = {
-        s: sorted(locs.map(lambda x: tuple(x.split('/', maxsplit=1))))
-        for s, locs in best_splits.items()
-    }
-    if test_split is not None:
-        split_to_locs['test'] = test_split
-    return split_to_locs
+            if score < best_score:
+                tqdm.write(f'New lowest score: {score}')
+                best_score = score
+                best_splits = split_to_locs
 
+        assert best_splits is not None
+        split_to_locs = {
+            s: sorted(locs.map(lambda x: tuple(x.split('/', maxsplit=1))))
+            for s, locs in best_splits.items()
+        }
+        if test_split is not None:
+            split_to_locs['test'] = test_split
+        return split_to_locs, None
+
+    elif avoid_overlap=='sequence':
+        # create DataFrame of counts. rows = seq, columns = labels
+        seq_label_counts = (df.groupby(['label', 'dataset_seq']).size()
+                            .unstack('label', fill_value=0))
+        num_seq = len(seq_label_counts)
+
+        # label_count: label => number of examples
+        # seq_count: label => number of seq containing that label
+        label_count = seq_label_counts.sum()
+        seq_count = (seq_label_counts > 0).sum()
+
+        best_score = np.inf  # lower is better
+        best_splits = None
+        for _ in tqdm(range(10_000)):
+
+            # generate a new split
+            num_train = int(num_seq * (train_frac + np.random.uniform(-.03, .03)))
+            if test_frac > 0:
+                num_val = int(num_seq * (val_frac + np.random.uniform(-.03, .03)))
+            else:
+                num_val = num_seq - num_train
+            permuted_seq = seq_label_counts.index[np.random.permutation(num_seq)]
+            split_to_seq = {'train': permuted_seq[:num_train],
+                            'val': permuted_seq[num_train:num_train + num_val]}
+            if test_frac > 0:
+                split_to_seq['test'] = permuted_seq[num_train + num_val:]
+
+            # score the split
+            score = 0.
+            for split, seq in split_to_seq.items():
+                split_df = seq_label_counts.loc[seq]
+                target = targets[split]
+
+                # SSE for # of images per label (with 2x weight)
+                crop_frac = split_df.sum() / label_count
+                score += 2 * ((crop_frac - target) ** 2).sum()
+
+                # SSE for # of locs per label
+                seq_frac = (split_df > 0).sum() / seq_count
+                score += ((seq_frac - target) ** 2).sum()
+
+            if score < best_score:
+                tqdm.write(f'New lowest score: {score}')
+                best_score = score
+                best_splits = split_to_seq
+        assert best_splits is not None
+        split_to_seq = {
+            s: sorted(seq.map(lambda x: tuple(x.split('/', maxsplit=1))))
+            for s, seq in best_splits.items()
+        }
+
+        return None, split_to_seq        
+
+
+    elif avoid_overlap=='hybrid':
+        # create DataFrame of counts. rows = locations, columns = labels
+        loc_label_counts = (df.groupby(['label', 'dataset_location']).size()
+                            .unstack('label', fill_value=0))
+        num_locs = len(loc_label_counts)
+        # label_count: label => number of examples
+        # loc_count: label => number of locs containing that label
+        label_count = loc_label_counts.sum()
+        loc_count = (loc_label_counts > 0).sum()
+        best_score = np.inf  # lower is better
+        best_splits = None
+        for _ in tqdm(range(10_000)):
+
+            # generate a new split
+            num_train = int(num_locs * (train_frac + np.random.uniform(-.03, .03)))
+            if test_frac > 0:
+                num_val = int(num_locs * (val_frac + np.random.uniform(-.03, .03)))
+            else:
+                num_val = num_locs - num_train
+            num_tv = num_train + num_val
+            permuted_locs = loc_label_counts.index[np.random.permutation(num_locs)]
+            split_to_locs = {'train_val': permuted_locs[:num_tv],
+                            'test': permuted_locs[num_tv:]}
+            # if test_frac > 0:
+            #     split_to_locs['test'] = permuted_locs[num_train + num_val:]
+            # score the split
+            score = 0.
+            for split, locs in split_to_locs.items():
+                split_df = loc_label_counts.loc[locs]
+                target = targets[split]
+
+                # SSE for # of images per label (with 2x weight)
+                crop_frac = split_df.sum() / label_count
+                score += 2 * ((crop_frac - target) ** 2).sum()
+
+                # SSE for # of locs per label
+                loc_frac = (split_df > 0).sum() / loc_count
+                score += ((loc_frac - target) ** 2).sum()
+
+            if score < best_score:
+                tqdm.write(f'New lowest score: {score}')
+                best_score = score
+                best_splits = split_to_locs
+        assert best_splits is not None
+        split_to_locs = {
+            s: sorted(locs.map(lambda x: tuple(x.split('/', maxsplit=1))))
+            for s, locs in best_splits.items()
+        }
+        if test_split is not None:
+            split_to_locs['test'] = test_split
+                 
+        # dftv is the part of df that does not contain test locations
+        test_location_list = list(map(lambda x: x[0] +'/' + x[1], split_to_locs['test']))
+        dftv = df[~df['dataset_location'].isin(test_location_list)]
+
+        # create DataFrame of counts. rows = seq, columns = labels
+        seq_label_counts = (dftv.groupby(['label', 'dataset_seq']).size()
+                            .unstack('label', fill_value=0))
+        num_seq = len(seq_label_counts)
+
+        # label_count: label => number of examples
+        # seq_count: label => number of seq containing that label
+        label_count = seq_label_counts.sum()
+        seq_count = (seq_label_counts > 0).sum()
+
+        best_score = np.inf  # lower is better
+        best_splits = None
+        for _ in tqdm(range(10_000)):
+
+            # generate a new split
+            num_train = int(num_seq * (train_frac + np.random.uniform(-.03, .03)))
+            num_val = num_seq - num_train
+            permuted_seq = seq_label_counts.index[np.random.permutation(num_seq)]
+            split_to_seq = {'train': permuted_seq[:num_train],
+                            'val': permuted_seq[num_train:]}
+
+            # score the split
+            score = 0.
+            for split, seq in split_to_seq.items():
+                split_df = seq_label_counts.loc[seq]
+                target = targets[split]
+
+                # SSE for # of images per label (with 2x weight)
+                crop_frac = split_df.sum() / label_count
+                score += 2 * ((crop_frac - target) ** 2).sum()
+
+                # SSE for # of locs per label
+                seq_frac = (split_df > 0).sum() / seq_count
+                score += ((seq_frac - target) ** 2).sum()
+
+            if score < best_score:
+                tqdm.write(f'New lowest score: {score}')
+                best_score = score
+                best_splits = split_to_seq
+        assert best_splits is not None
+        split_to_seq = {
+            s: sorted(seq.map(lambda x: tuple(x.split('/', maxsplit=1))))
+            for s, seq in best_splits.items()
+        }
+
+        return split_to_locs, split_to_seq
+
+
+# As the function below has not been incorporated for separate method for val and test, 
+# hybrid/sequence-based avoid overlap is NOT yet supported by smallest_first method
 
 def create_splits_smallest_label_first(
         df: pd.DataFrame,
@@ -470,7 +672,8 @@ def create_splits_smallest_label_first(
         ordered_locs = sort_locs_by_size(
             loc_to_size=df[mask].groupby('dataset_location').size().to_dict(),
             prioritize=prioritize.get(label, None))
-        ordered_locs = [loc for loc in ordered_labels if loc not in seen_locs]
+        # ordered_locs = [loc for loc in ordered_labels if loc not in seen_locs]
+        ordered_locs = [loc for loc in ordered_locs if loc not in seen_locs]
 
         for loc in ordered_locs:
             seen_locs.add(loc)
@@ -559,6 +762,10 @@ def _parse_args() -> argparse.Namespace:
         '--min-locs', type=int,
         help='minimum number of locations that each label must have in order '
              'to be included (does not apply to match-test-splits)')
+    csv_group.add_argument(
+        '--min-seq', type=int,
+        help='minimum number of sequences that each label must have in order '
+             'to be included (does not apply to match-test-splits)')
 
     # arguments only relevant for creating the splits JSON
     splits_group = parser.add_argument_group(
@@ -581,6 +788,9 @@ def _parse_args() -> argparse.Namespace:
         '--label-spec',
         help='optional path to label specification JSON file, if specifying '
              'dataset priority. Requires --method=smallest_first.')
+    splits_group.add_argument(
+        '--avoid-overlap', choices=['location', 'sequence','hybrid'], default='location',
+        help='splits ensuring there is no overlap across different splits.')
     return parser.parse_args()
 
 
@@ -598,4 +808,5 @@ if __name__ == '__main__':
          val_frac=args.val_frac,
          test_frac=args.test_frac,
          splits_method=args.method,
+         avoid_overlap=args.avoid_overlap,
          label_spec_json_path=args.label_spec)
