@@ -56,7 +56,7 @@ Example usage:
         --output-dir run --json-indent 2
 """
 from __future__ import annotations
-
+import path
 import argparse
 from collections import defaultdict
 from collections.abc import Container, Iterable, Mapping, MutableMapping
@@ -67,9 +67,10 @@ import os
 import pprint
 import random
 from typing import Any
+from itertools import tee
 
 import pandas as pd
-import path_utils  # from ai4eutils
+import path_utils # from ai4eutils  
 import sas_blob_utils  # from ai4eutils
 from tqdm import tqdm
 
@@ -268,6 +269,7 @@ def get_output_json(label_to_inclusions: dict[str, set[tuple[str, str]]],
         - 'class': str, class label from the dataset
         - 'label': list of str, assigned output label
         - 'bbox': list of dicts, optional
+        # - 'sequence': str, optional
     """
     # because MegaDB is organized by dataset, we do the same
     # ds_to_labels = {
@@ -312,6 +314,7 @@ def get_output_json(label_to_inclusions: dict[str, set[tuple[str, str]]],
     SELECT
         seq.dataset,
         seq.location,
+        seq.seq_id,
         img.file,
         [img.class[0], seq.class[0]][0] as class,
         img.bbox
@@ -324,6 +327,25 @@ def get_output_json(label_to_inclusions: dict[str, set[tuple[str, str]]],
             AND (NOT IS_DEFINED(img.class))
         )
     '''
+    # query = '''
+    # SELECT
+    #     seq.dataset,
+    #     seq.seq_id,
+    #     img.file,
+    #     [img.class[0], seq.class[0]][0] as class,
+    #     img.bbox
+    # FROM sequences seq JOIN img IN seq.images
+    # WHERE (ARRAY_LENGTH(img.class) = 1
+    #        AND ARRAY_CONTAINS(@dataset_labels, img.class[0])
+    #     )
+    #     OR (ARRAY_LENGTH(seq.class) = 1
+    #         AND ARRAY_CONTAINS(@dataset_labels, seq.class[0])
+    #         AND (NOT IS_DEFINED(img.class))
+    #     )
+    # '''
+
+
+
 
     output_json = {}  # maps full image path to json object
     for ds in tqdm(sorted(ds_to_labels.keys())):  # sort for determinism
@@ -336,20 +358,25 @@ def get_output_json(label_to_inclusions: dict[str, set[tuple[str, str]]],
 
         ds_labels = sorted(ds_to_labels[ds].keys())
         tqdm.write(f'Querying dataset "{ds}" for dataset labels: {ds_labels}')
-
+        # ds = "snapshot_mountain_zebra"
+        # ds = "snapshotserengeti"
         start = datetime.now()
         parameters = [dict(name='@dataset_labels', value=ds_labels)]
         results = megadb.query_sequences_table(
             query, partition_key=ds, parameters=parameters)
+        results_backup = [kk for kk in list(results)]
+        # results, results_backup = tee(results)
+        # results_backup = list(results)
         elapsed = (datetime.now() - start).total_seconds()
-        tqdm.write(f'- query took {elapsed:.0f}s, found {len(results)} images')
+        tqdm.write(f'- query took {elapsed:.0f}s, found {len(list(results))} images')
 
         # if no path prefix, set it to the empty string '', because
         #     os.path.join('', x, '') = '{x}/'
+        # print(datasets_table)
         path_prefix = datasets_table[ds].get('path_prefix', '')
         count_corrected = 0
         count_removed = 0
-        for result in results:
+        for result in results_backup:
             # result keys
             # - already has: ['dataset', 'location', 'file', 'class', 'bbox']
             # - add ['label'], remove ['file']
